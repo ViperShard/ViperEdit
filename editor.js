@@ -46,18 +46,101 @@
   /* ============================================================
      Pagination — true Google-Docs-style paged layout.
 
-     The editor stays a single contenteditable, but we insert invisible
-     "gap blocks" (inline margin-top on the block that begins each new
-     page) so text visually lands on successive paper panels. Those
-     panels are rendered in .paper-stack behind the editor with a real
-     24px gap between them, so the wallpaper shows through between pages.
+     Behind the single contenteditable we render N distinct paper panels
+     with a 24 px gap between them (the wallpaper shows through the gap).
+
+     After every input we:
+       1. Un-split any blocks we split last time (merge `[data-ve-split]`
+          elements back into their previous sibling).
+       2. Clear any `[data-ve-pagebreak]` margin-tops we injected.
+       3. Walk the editor's top-level blocks:
+            - If a block fits on the current page, keep walking.
+            - If it starts on this page but would cross the page's bottom
+              margin AND it's no taller than a page, shove it whole onto
+              the next page via an injected top-margin.
+            - If it's taller than a page (one long paragraph), SPLIT it
+              at the page boundary using caretPositionFromPoint +
+              Range.extractContents(), leaving the second half on a new
+              page with the same top-margin.
+       4. Sync the .paper panel count to the final page count.
 
      Geometry per page:
-       top-margin (= pad-y)  +  content-area  +  bottom-margin (= pad-y) = 1056
-       The gap block we inject is  pad-y (bottom margin of previous page)
-                                 + 24  (visible wallpaper gap)
-                                 + pad-y (top margin of next page).
+       pad-y (top margin)  +  content-area  +  pad-y (bottom margin)  = 1056 px
+       Injected between pages: pad-y + 24 (visible gap) + pad-y
      ============================================================ */
+
+  const CURSOR_MARKER_ID = '__ve_cursor_marker__';
+
+  function placeCursorMarker() {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return false;
+    const r = sel.getRangeAt(0).cloneRange();
+    const m = document.createElement('span');
+    m.id = CURSOR_MARKER_ID;
+    m.setAttribute('data-ve-cursor', '1');
+    m.style.cssText = 'display:inline;width:0;height:0;';
+    r.insertNode(m);
+    return true;
+  }
+
+  function restoreCursorMarker() {
+    const m = document.getElementById(CURSOR_MARKER_ID);
+    if (!m) return;
+    const r = document.createRange();
+    r.setStartAfter(m);
+    r.collapse(true);
+    const sel = window.getSelection();
+    try { sel.removeAllRanges(); sel.addRange(r); } catch {}
+    m.remove();
+  }
+
+  // Split a block-level element at the given viewport Y coordinate.
+  // Returns the newly-created "second half" element, or null if the
+  // split couldn't be done (off-screen, unsupported, etc.).
+  function splitBlockAtY(block, viewportY) {
+    const rect = block.getBoundingClientRect();
+    if (viewportY <= rect.top || viewportY >= rect.bottom) return null;
+    const x = rect.left + Math.min(20, rect.width / 4);
+
+    let node, offset;
+    if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(x, viewportY);
+      if (!pos) return null;
+      node = pos.offsetNode;
+      offset = pos.offset;
+    } else if (document.caretRangeFromPoint) {
+      const r = document.caretRangeFromPoint(x, viewportY);
+      if (!r) return null;
+      node = r.startContainer;
+      offset = r.startOffset;
+    } else {
+      return null;
+    }
+    if (!node || !block.contains(node)) return null;
+
+    const range = document.createRange();
+    try {
+      range.setStart(node, offset);
+      range.setEndAfter(block.lastChild || block);
+    } catch { return null; }
+
+    let frag;
+    try { frag = range.extractContents(); } catch { return null; }
+    if (!frag || !frag.childNodes.length) return null;
+
+    const newBlock = document.createElement(block.tagName);
+    // Copy attributes except our own housekeeping and the inline style
+    // (which contains the page-break margin we manage ourselves).
+    for (const a of Array.from(block.attributes)) {
+      if (a.name === 'data-ve-pagebreak' || a.name === 'data-ve-split') continue;
+      if (a.name === 'style') continue;
+      try { newBlock.setAttribute(a.name, a.value); } catch {}
+    }
+    newBlock.appendChild(frag);
+    block.parentNode.insertBefore(newBlock, block.nextSibling);
+    return newBlock;
+  }
+
   const Pagination = {
     PAGE_H:   11 * 96,   // 1056 px — US Letter @ 96 dpi
     PAPER_GAP: 24,       // keep in sync with CSS .paper-stack gap
@@ -72,88 +155,151 @@
       });
     },
 
+    // Undo any splits/margins from the last pass so we measure with the
+    // document's "canonical" structure.
+    _reset(editor) {
+      // Merge split-continuation blocks back into their previous sibling.
+      const splits = Array.from(editor.querySelectorAll('[data-ve-split="1"]'));
+      for (const s of splits) {
+        const prev = s.previousElementSibling;
+        if (prev && prev.tagName === s.tagName) {
+          while (s.firstChild) prev.appendChild(s.firstChild);
+          s.remove();
+        } else {
+          s.removeAttribute('data-ve-split');
+        }
+      }
+      // Clear page-break margins.
+      editor.querySelectorAll('[data-ve-pagebreak="1"]').forEach((b) => {
+        b.removeAttribute('data-ve-pagebreak');
+        b.style.marginTop = '';
+        if (!b.getAttribute('style')) b.removeAttribute('style');
+      });
+    },
+
     update() {
       const editor = $('#editor');
       const page   = $('#page');
       const stack  = $('#paper-stack');
       if (!editor || !page || !stack) return;
 
-      // Clear any gap margins we injected last time.
-      editor.querySelectorAll('[data-ve-pagebreak="1"]').forEach((b) => {
-        b.removeAttribute('data-ve-pagebreak');
-        b.style.marginTop = '';
-        if (!b.getAttribute('style')) b.removeAttribute('style');
-      });
+      const hadCursor = placeCursorMarker();
+      try {
+        this._reset(editor);
 
-      const cs     = getComputedStyle(editor);
-      const padTop = parseFloat(cs.paddingTop)    || 0;
-      const padBot = parseFloat(cs.paddingBottom) || 0;
-      const contentH  = this.PAGE_H - padTop - padBot;    // usable text height per page
-      const gapBlockH = padBot + this.PAPER_GAP + padTop; // vertical space between text regions
+        const cs     = getComputedStyle(editor);
+        const padTop = parseFloat(cs.paddingTop)    || 0;
+        const padBot = parseFloat(cs.paddingBottom) || 0;
+        const contentH  = this.PAGE_H - padTop - padBot;
+        const gapBlockH = padBot + this.PAPER_GAP + padTop;
 
-      // Walk top-level children. When a block would cross its page's bottom
-      // margin, give it a marginTop of gapBlockH so it slides to the top
-      // content area of the next paper.
-      let pageContentStart = padTop;   // y where the current page's content begins (editor coords)
-      let pageCount = 1;
+        let pageContentStart = padTop;
+        let pageCount = 1;
 
-      let i = 0;
-      while (i < editor.children.length) {
-        const b = editor.children[i];
+        let i = 0;
+        let iter = 0;
+        const MAX_ITER = 1000;     // safety net
 
-        // Skip non-layout children (shouldn't be any, but be safe).
-        if (!(b instanceof HTMLElement)) { i++; continue; }
+        while (i < editor.children.length && iter++ < MAX_ITER) {
+          const b = editor.children[i];
+          if (!(b instanceof HTMLElement)) { i++; continue; }
 
-        const bBottom = b.offsetTop + b.offsetHeight;
-        const pageEnd = pageContentStart + contentH;
+          const bTop    = b.offsetTop;
+          const bH      = b.offsetHeight;
+          const bBottom = bTop + bH;
+          const pageEnd = pageContentStart + contentH;
 
-        if (bBottom > pageEnd && i > 0) {
-          // Push this block to the next page by inflating its top margin.
-          b.setAttribute('data-ve-pagebreak', '1');
-          b.style.marginTop = gapBlockH + 'px';
-          // offsetTop is now shifted by gapBlockH; record new page start.
-          pageContentStart = b.offsetTop;
-          pageCount++;
+          if (bBottom <= pageEnd) { i++; continue; }
+
+          // Block bottom overflows the page.
+          const editorRect = editor.getBoundingClientRect();
+          const pageEndScreenY = editorRect.top + pageEnd;
+
+          // Case 1: block starts on this page and fits whole on one page
+          //         → shove entire block to the next page.
+          const startsOnThisPage = bTop >= pageContentStart && bTop < pageEnd;
+          if (startsOnThisPage && bH <= contentH && i > 0) {
+            b.setAttribute('data-ve-pagebreak', '1');
+            b.style.marginTop = gapBlockH + 'px';
+            pageContentStart = b.offsetTop;
+            pageCount++;
+            i++;
+            continue;
+          }
+
+          // Case 2: block is taller than a page or starts at the very top
+          //         → split it at the page boundary.
+          const newBlock = splitBlockAtY(b, pageEndScreenY);
+          if (newBlock) {
+            newBlock.setAttribute('data-ve-split',     '1');
+            newBlock.setAttribute('data-ve-pagebreak', '1');
+            newBlock.style.marginTop = gapBlockH + 'px';
+            pageContentStart = newBlock.offsetTop;
+            pageCount++;
+            i++;                  // examine newBlock on next iteration
+            continue;
+          }
+
+          // Couldn't split (e.g. offscreen). Best-effort: push whole block.
+          if (i > 0) {
+            b.setAttribute('data-ve-pagebreak', '1');
+            b.style.marginTop = gapBlockH + 'px';
+            pageContentStart = b.offsetTop;
+            pageCount++;
+          }
+          i++;
         }
-        i++;
+
+        // Sync the paper stack to the final page count.
+        const have = stack.children.length;
+        if (have < pageCount) {
+          const frag = document.createDocumentFragment();
+          for (let j = have; j < pageCount; j++) {
+            const p = document.createElement('div');
+            p.className = 'paper';
+            frag.appendChild(p);
+          }
+          stack.appendChild(frag);
+        } else if (have > pageCount) {
+          for (let j = have - 1; j >= pageCount; j--) {
+            stack.removeChild(stack.children[j]);
+          }
+        }
+
+        page.style.minHeight =
+          (pageCount * this.PAGE_H + Math.max(0, pageCount - 1) * this.PAPER_GAP) + 'px';
+
+        const pc = $('#page-count-stat');
+        if (pc) pc.textContent = `${pageCount} page${pageCount === 1 ? '' : 's'}`;
+      } finally {
+        if (hadCursor) restoreCursorMarker();
       }
-
-      // Sync the paper stack to the page count.
-      const have = stack.children.length;
-      if (have < pageCount) {
-        const frag = document.createDocumentFragment();
-        for (let j = have; j < pageCount; j++) {
-          const p = document.createElement('div');
-          p.className = 'paper';
-          frag.appendChild(p);
-        }
-        stack.appendChild(frag);
-      } else if (have > pageCount) {
-        for (let j = have - 1; j >= pageCount; j--) {
-          stack.removeChild(stack.children[j]);
-        }
-      }
-
-      // .page height = N pages + (N-1) gaps, so the paper stack fills exactly.
-      page.style.minHeight =
-        (pageCount * this.PAGE_H + Math.max(0, pageCount - 1) * this.PAPER_GAP) + 'px';
-
-      const pc = $('#page-count-stat');
-      if (pc) pc.textContent = `${pageCount} page${pageCount === 1 ? '' : 's'}`;
     }
   };
 
-  // When we serialize the editor (save, HTML export), strip the temporary
-  // `data-ve-pagebreak` markers and the inline marginTop we added — those
-  // are render-time-only hints; persisted documents should be clean.
+  // Serialized view of the editor without our render-time pagination
+  // hints: split-continuation blocks are merged back, injected margin-
+  // tops and data-ve-* attributes are stripped.
   function cleanEditorHTML() {
     const editor = $('#editor');
     const clone = editor.cloneNode(true);
+    // Merge splits back.
+    Array.from(clone.querySelectorAll('[data-ve-split="1"]')).forEach((s) => {
+      const prev = s.previousElementSibling;
+      if (prev && prev.tagName === s.tagName) {
+        while (s.firstChild) prev.appendChild(s.firstChild);
+        s.remove();
+      } else {
+        s.removeAttribute('data-ve-split');
+      }
+    });
+    // Strip pagebreak margins and cursor markers.
     clone.querySelectorAll('[data-ve-pagebreak]').forEach((b) => {
       b.removeAttribute('data-ve-pagebreak');
       b.style.marginTop = '';
       if (!b.getAttribute('style')) b.removeAttribute('style');
     });
+    clone.querySelectorAll('[data-ve-cursor], #' + CURSOR_MARKER_ID).forEach((n) => n.remove());
     return clone.innerHTML;
   }
 
