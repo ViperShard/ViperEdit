@@ -20,5 +20,5 @@
    ============================================================ */
 
 window.VE_CONFIG = {
-  googleClientId: ''   // e.g. '1234567890-abcxyz.apps.googleusercontent.com'
+  googleClientId: '1079936144091-dqo63rdag1i91vs62r5sq0ua81aea9ki.apps.googleusercontent.com'
 };
