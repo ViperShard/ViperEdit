@@ -1182,20 +1182,24 @@
       this.updateCounts();
     },
 
-    // Indent (Tab) / outdent (Shift+Tab) the block containing the caret.
-    // For list items we defer to execCommand since that nests the list
-    // naturally. For every other block we set an explicit margin-left —
-    // Chrome's built-in "indent" would wrap the block in a <blockquote>,
-    // which our blockquote styling paints purple (looks like a "blob").
+    // Tab = first-line indent on the paragraph containing the caret.
+    // Uses CSS text-indent so only the first line shifts right — matches
+    // Google Docs' Tab behavior. Inside a list item we defer to the
+    // native list-nesting indent. We explicitly skip .paper wrappers so
+    // the block-walker doesn't end up shifting the whole page.
     _indentBlock(direction) {
       const sel = window.getSelection();
       if (!sel || !sel.rangeCount) return;
       const r = sel.getRangeAt(0);
       let block = r.startContainer;
       if (block.nodeType === 3) block = block.parentNode;
-      const BLOCK_TAGS = /^(?:P|H[1-6]|LI|DIV|PRE|BLOCKQUOTE)$/i;
+      // Only true text blocks are indentable. Crucially, .paper and the
+      // editor root are NOT in this set, even though they're DIVs — we
+      // don't want Tab to shift the whole page.
+      const TEXT_BLOCKS = /^(?:P|H[1-6]|LI|PRE|BLOCKQUOTE)$/i;
       while (block && block !== this.el) {
-        if (block.tagName && BLOCK_TAGS.test(block.tagName)) break;
+        if (block.tagName && TEXT_BLOCKS.test(block.tagName)) break;
+        if (block.classList && block.classList.contains('paper')) return;
         block = block.parentNode;
       }
       if (!block || block === this.el) return;
@@ -1203,10 +1207,10 @@
         document.execCommand(direction > 0 ? 'indent' : 'outdent');
         return;
       }
-      const step = 40;
-      const current = parseFloat(block.style.marginLeft) || 0;
+      const step = 40;   // 40 px = roughly one Google-Docs tab stop
+      const current = parseFloat(block.style.textIndent) || 0;
       const next = Math.max(0, current + direction * step);
-      block.style.marginLeft = next ? next + 'px' : '';
+      block.style.textIndent = next ? next + 'px' : '';
       if (!block.getAttribute('style')) block.removeAttribute('style');
     },
 
