@@ -1006,12 +1006,30 @@
       on(this.el, 'keyup',  () => UI.refreshToolbar());
       on(this.el, 'mouseup', () => UI.refreshToolbar());
 
+      // Pending-style queue — set by toolbar controls (color, highlight,
+      // font size) when the user picks a value with no text selected. The
+      // very next text insertion wraps the typed character(s) in a span
+      // carrying those styles; subsequent typing continues inside that
+      // span because the caret lives inside it.
+      on(this.el, 'beforeinput', (e) => this._handlePendingStyleInput(e));
+
+      // Clicking anywhere in the editor cancels any pending style that
+      // hasn't been consumed yet — mirrors Google Docs, where navigating
+      // away without typing drops the "pending" color.
+      on(this.el, 'mousedown', () => {
+        // Small grace window so our own DOM mutations from _apply don't
+        // immediately clear the pending state.
+        if (Date.now() - this._pendingStyleSetAt > 120) {
+          this._clearPendingStyles();
+        }
+      });
+
       // Tab / Shift+Tab indent the current block (or list item) instead of
       // moving focus out of the editor. Matches Google Docs / Word behavior.
       on(this.el, 'keydown', (e) => {
         if (e.key === 'Tab') {
           e.preventDefault();
-          this._indentBlock(e.shiftKey ? -1 : 1);
+          this._indentFirstLine(e.shiftKey ? -1 : 1);
           this.scheduleSave();
           Pagination.schedule();
           return;
@@ -1124,6 +1142,9 @@
       // it across as many papers as the content needs.
       const inner = doc.html || '<p><br></p>';
       this.el.innerHTML = `<div class="paper">${inner}</div>`;
+      // Fresh doc state — drop any unconsumed pending style so it
+      // doesn't bleed into the next document's first keystroke.
+      this._clearPendingStyles();
       // Apply the document's per-side page margins before pagination
       // measures anything.
       Margins.apply(doc);
@@ -1182,36 +1203,154 @@
       this.updateCounts();
     },
 
-    // Tab = first-line indent on the paragraph containing the caret.
-    // Uses CSS text-indent so only the first line shifts right — matches
-    // Google Docs' Tab behavior. Inside a list item we defer to the
-    // native list-nesting indent. We explicitly skip .paper wrappers so
-    // the block-walker doesn't end up shifting the whole page.
-    _indentBlock(direction) {
+    // Walk up from the caret to the nearest editable text block, stopping
+    // if we hit a .paper wrapper or the editor root. Returns null if
+    // there's no viable block to indent.
+    _blockAtCaret() {
       const sel = window.getSelection();
-      if (!sel || !sel.rangeCount) return;
-      const r = sel.getRangeAt(0);
-      let block = r.startContainer;
+      if (!sel || !sel.rangeCount) return null;
+      let block = sel.getRangeAt(0).startContainer;
       if (block.nodeType === 3) block = block.parentNode;
-      // Only true text blocks are indentable. Crucially, .paper and the
-      // editor root are NOT in this set, even though they're DIVs — we
-      // don't want Tab to shift the whole page.
       const TEXT_BLOCKS = /^(?:P|H[1-6]|LI|PRE|BLOCKQUOTE)$/i;
       while (block && block !== this.el) {
-        if (block.tagName && TEXT_BLOCKS.test(block.tagName)) break;
-        if (block.classList && block.classList.contains('paper')) return;
+        if (block.tagName && TEXT_BLOCKS.test(block.tagName)) return block;
+        if (block.classList && block.classList.contains('paper')) return null;
         block = block.parentNode;
       }
-      if (!block || block === this.el) return;
+      return null;
+    },
+
+    // Tab in body text = first-line indent via CSS text-indent on the
+    // current paragraph. In a list item we defer to the native nesting
+    // (execCommand indent/outdent), which is what the user expects for
+    // bullet and number lists.
+    _indentFirstLine(direction) {
+      const block = this._blockAtCaret();
+      if (!block) return;
       if (block.tagName === 'LI') {
         document.execCommand(direction > 0 ? 'indent' : 'outdent');
         return;
       }
-      const step = 40;   // 40 px = roughly one Google-Docs tab stop
+      const step = 40;
       const current = parseFloat(block.style.textIndent) || 0;
       const next = Math.max(0, current + direction * step);
       block.style.textIndent = next ? next + 'px' : '';
       if (!block.getAttribute('style')) block.removeAttribute('style');
+    },
+
+    // The toolbar Increase/Decrease-indent buttons shift the WHOLE
+    // paragraph (left margin), not just the first line. Uses margin-left
+    // on the text block — never on .paper, which would offset the page.
+    _indentBlockWhole(direction) {
+      const block = this._blockAtCaret();
+      if (!block) return;
+      if (block.tagName === 'LI') {
+        document.execCommand(direction > 0 ? 'indent' : 'outdent');
+        return;
+      }
+      const step = 40;
+      const current = parseFloat(block.style.marginLeft) || 0;
+      const next = Math.max(0, current + direction * step);
+      block.style.marginLeft = next ? next + 'px' : '';
+      if (!block.getAttribute('style')) block.removeAttribute('style');
+    },
+
+    // ---------- Pending-style queue ----------
+    // When a toolbar control (color/highlight/font-size) is used with
+    // no text selected, we stash a { color?, backgroundColor?, fontSize? }
+    // record here. The next beforeinput(inserText) event wraps the typed
+    // text in a span carrying those styles and places the caret inside
+    // the span so continued typing stays styled.
+    pendingStyles: {},
+    _pendingStyleSetAt: 0,
+
+    _setPendingStyle(prop, value) {
+      this.pendingStyles[prop] = value;
+      this._pendingStyleSetAt = Date.now();
+    },
+    _clearPendingStyles() {
+      this.pendingStyles = {};
+      this._pendingStyleSetAt = 0;
+    },
+    _hasPendingStyles() {
+      for (const _ in this.pendingStyles) return true;
+      return false;
+    },
+
+    _handlePendingStyleInput(e) {
+      if (!this._hasPendingStyles()) return;
+      if (e.inputType !== 'insertText' || !e.data) {
+        // Non-typing input (delete, paste, arrow-driven composition, …)
+        // cancels the pending state.
+        this._clearPendingStyles();
+        return;
+      }
+      e.preventDefault();
+      const sel = window.getSelection();
+      if (!sel || !sel.rangeCount) { this._clearPendingStyles(); return; }
+      const r = sel.getRangeAt(0);
+      const span = document.createElement('span');
+      for (const prop of Object.keys(this.pendingStyles)) {
+        span.style[prop] = this.pendingStyles[prop];
+      }
+      span.textContent = e.data;
+      r.deleteContents();
+      r.insertNode(span);
+      const caret = document.createRange();
+      caret.setStart(span.firstChild, span.firstChild.length);
+      caret.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(caret);
+      this._clearPendingStyles();
+      this.scheduleSave();
+      this.updateCounts();
+      Pagination.schedule();
+    },
+
+    // Apply a font size to the current selection if it has text, or stash
+    // it as a pending style so the user's next typing is in that size.
+    applyFontSize(pt) {
+      if (!Number.isFinite(pt)) return;
+      const value = pt + 'pt';
+      this.el.focus();
+      const sel = window.getSelection();
+      const hasSel = sel && sel.rangeCount && !sel.isCollapsed &&
+        this.el.contains(sel.getRangeAt(0).startContainer);
+      if (!hasSel) {
+        this._setPendingStyle('fontSize', value);
+        return;
+      }
+      // Selection present — wrap each affected text run in <span style="font-size:Xpt">.
+      // We use the deprecated fontSize=4 trick to get Chrome to emit <font>
+      // wrappers, then rewrite them to styled spans for CSS consistency.
+      document.execCommand('fontSize', false, 4);
+      $$('font[size="4"]', this.el).forEach((f) => {
+        const s = document.createElement('span');
+        s.style.fontSize = value;
+        while (f.firstChild) s.appendChild(f.firstChild);
+        f.replaceWith(s);
+      });
+      this.scheduleSave();
+      this.updateCounts();
+      Pagination.schedule();
+    },
+
+    // Save/restore the editor's selection around toolbar controls that
+    // steal focus (native <select>, color pickers, etc.).
+    _savedToolbarRange: null,
+    _saveSelectionForToolbar() {
+      const sel = window.getSelection();
+      if (!sel || !sel.rangeCount) { this._savedToolbarRange = null; return; }
+      const r = sel.getRangeAt(0);
+      if (!this.el.contains(r.startContainer)) { this._savedToolbarRange = null; return; }
+      this._savedToolbarRange = r.cloneRange();
+    },
+    _restoreSelectionForToolbar() {
+      this.el.focus();
+      if (!this._savedToolbarRange) return;
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(this._savedToolbarRange);
     },
 
     insertHTML(html) {
@@ -1447,10 +1586,8 @@
     },
 
     _apply(cmd, value) {
-      // 1. Make sure the editor is focused and selection is inside it.
-      //    preventDefault on mousedown usually keeps the live selection
-      //    intact, but savedRange is a fallback if something else stole
-      //    focus.
+      // Restore the editor's selection + focus (in case clicking the
+      // trigger or popup stole them).
       let sel = window.getSelection();
       const selInEditor = sel && sel.rangeCount &&
         Editor.el.contains(sel.getRangeAt(0).startContainer);
@@ -1465,36 +1602,29 @@
       sel = window.getSelection();
       if (!sel || !sel.rangeCount) return;
       const r = sel.getRangeAt(0);
+      const cssProp = cmd === 'hiliteColor' ? 'backgroundColor' : 'color';
 
-      // 2. Collapsed cursor (no text selected) — insert a styled span
-      //    seeded with a zero-width placeholder and move the caret
-      //    inside it, so the user's next keystroke types in the
-      //    chosen color. This is how Google Docs' "click a color
-      //    first, then start typing" flow works.
-      if (r.collapsed && value !== null) {
-        this._insertPendingColorSpan(cmd, value);
+      // Collapsed caret (no text selected) → stash as a pending style.
+      // Editor._handlePendingStyleInput will wrap the next typed text in
+      // a span carrying this style.
+      if (r.collapsed) {
+        if (value === null) {
+          // "None" with a collapsed caret: drop any pending style for
+          // this property AND move the caret out of any ancestor span
+          // currently applying it, so typing lands uncolored.
+          if (cssProp in Editor.pendingStyles) {
+            delete Editor.pendingStyles[cssProp];
+          }
+          this._exitStyleSpanAtCaret(cmd);
+        } else {
+          Editor._setPendingStyle(cssProp, value);
+        }
         this._paintTriggerBar(cmd, value);
         UI.refreshToolbar();
-        Editor.scheduleSave();
-        Editor.updateCounts();
-        Pagination.schedule();
         return;
       }
 
-      // 3. "None" with a collapsed cursor: exit the colored span the
-      //    cursor is currently inside (if any) by moving the caret to
-      //    just after that span, so the next keystroke is uncolored.
-      if (r.collapsed && value === null) {
-        this._exitStyleSpanAtCaret(cmd);
-        this._paintTriggerBar(cmd, value);
-        UI.refreshToolbar();
-        Editor.scheduleSave();
-        Editor.updateCounts();
-        Pagination.schedule();
-        return;
-      }
-
-      // 4. Non-empty selection — apply via execCommand as before.
+      // Non-empty selection — apply directly.
       if (value === null) {
         if (cmd === 'hiliteColor') {
           document.execCommand('hiliteColor', false, 'transparent');
@@ -1620,10 +1750,27 @@
     ],
 
     init() {
-      // Toolbar buttons with data-cmd
+      // Toolbar buttons with data-cmd. Most go straight through to the
+      // browser's execCommand, but a handful we intercept because the
+      // native command either wraps content in a <blockquote> (indent /
+      // outdent) or doesn't match the design we want.
+      const CMD_OVERRIDES = {
+        indent:  () => Editor._indentBlockWhole(1),
+        outdent: () => Editor._indentBlockWhole(-1),
+      };
       $$('.tb-btn[data-cmd]').forEach((btn) => {
         on(btn, 'mousedown', (e) => e.preventDefault());
-        on(btn, 'click', () => Editor.exec(btn.dataset.cmd));
+        on(btn, 'click', () => {
+          const cmd = btn.dataset.cmd;
+          if (CMD_OVERRIDES[cmd]) {
+            CMD_OVERRIDES[cmd]();
+            Editor.scheduleSave();
+            Editor.updateCounts();
+            Pagination.schedule();
+          } else {
+            Editor.exec(cmd);
+          }
+        });
       });
 
       // Color controls — dropdown with "None", a preset palette, and a
@@ -1633,33 +1780,29 @@
       // Block style
       on($('#block-style'), 'change', (e) => Editor.exec('formatBlock', `<${e.target.value.toUpperCase()}>`));
 
-      // Font family
-      on($('#font-family'), 'change', (e) => {
+      // Font family — save/restore around native <select> focus-steal.
+      const ff = $('#font-family');
+      on(ff, 'mousedown', () => Editor._saveSelectionForToolbar());
+      on(ff, 'change', (e) => {
+        Editor._restoreSelectionForToolbar();
+        const sel = window.getSelection();
+        const hasSel = sel && sel.rangeCount && !sel.isCollapsed;
+        if (!hasSel) {
+          Editor._setPendingStyle('fontFamily', e.target.value);
+          return;
+        }
         Editor.exec('fontName', e.target.value);
       });
 
-      // Font size picker maps to execCommand with inline style fallback
-      on($('#font-size'), 'change', (e) => {
-        const pt = parseInt(e.target.value, 10);
-        // fontSize execCommand uses 1..7 scale; instead wrap in span for fidelity
-        Editor.el.focus();
-        const sel = window.getSelection();
-        if (!sel || !sel.rangeCount || sel.isCollapsed) {
-          document.execCommand('fontSize', false, 4);
-          // Walk back and set inline size on resulting <font> tags
-          $$('font[size="4"]', Editor.el).forEach((f) => {
-            f.removeAttribute('size');
-            f.style.fontSize = pt + 'pt';
-          });
-        } else {
-          document.execCommand('fontSize', false, 4);
-          $$('font[size="4"]', Editor.el).forEach((f) => {
-            f.removeAttribute('size');
-            f.style.fontSize = pt + 'pt';
-          });
-        }
-        Editor.scheduleSave();
-        Editor.updateCounts();
+      // Font size: applies to selected text, or stashes a pending font
+      // size when nothing is selected (next typing uses it). The <select>
+      // element steals editor focus when clicked, so we mousedown-save
+      // the editor's selection + focus and restore both before applying.
+      const fs = $('#font-size');
+      on(fs, 'mousedown', () => Editor._saveSelectionForToolbar());
+      on(fs, 'change', (e) => {
+        Editor._restoreSelectionForToolbar();
+        Editor.applyFontSize(parseInt(e.target.value, 10));
       });
 
       // Action buttons
